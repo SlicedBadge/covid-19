@@ -34,7 +34,7 @@ def get_data():
 
     return county_data
 
-def smooth_cases(cases, cutoff=25, smoothing_param = 7, return_original = True):
+def smooth_cases(cases, cutoff=5, smoothing_param = 15, return_original = True):
     '''
     Prepares a pandas series `cases` defining the cumulative case counts over time by applying a rolling average
     and cutting off the time series before there were a certain number of cases (`cutoff`)
@@ -69,7 +69,7 @@ def smooth_cases(cases, cutoff=25, smoothing_param = 7, return_original = True):
     smoothed = new_cases.rolling(smoothing_param,
         win_type='gaussian',
         min_periods=1,
-        center=True).mean(std=(smoothing_param - (smoothing_param%2)) / 3).round() #modulo deals with odd numbers so we get a nice even std
+        center=True).mean(std=(smoothing_param - (smoothing_param%2)) / 3).round() #modulo deals with odd numbers so we get a nice even std (I changed this so it doesn't round because I feel like that is not necessary)
     
     #get the index of the first day where we are at the cutoff value
     idx_start = np.searchsorted(smoothed, cutoff)
@@ -117,6 +117,7 @@ def get_posteriors(sr, r_t_range = np.linspace(0, 12, 12*100+1), sigma=0.25, tra
     
     #drop na values
     sr = sr.dropna()
+    sr = sr.replace(0,1) #equations break if there are 0 new cases each day (not sure how much of an effect this has on results)
     
     # (1) Calculate Lambdas
     lam = sr[:-1].values * np.exp(GAMMA * (r_t_range[:, None] - 1))
@@ -169,6 +170,10 @@ def get_posteriors(sr, r_t_range = np.linspace(0, 12, 12*100+1), sigma=0.25, tra
         
         #(5c) Calcluate the denominator of Bayes' Rule P(k)
         denominator = np.sum(numerator)
+
+        # if current_day.day in [24,25,26]:
+        #     print("numerator", numerator)
+        #     print("denominator", denominator)
         
         # Execute full Bayes' Rule
         posteriors[current_day] = numerator/denominator
@@ -182,16 +187,37 @@ def get_posteriors(sr, r_t_range = np.linspace(0, 12, 12*100+1), sigma=0.25, tra
     else:
         return posteriors
 
-def highest_density_interval(pmf, p=.9, debug=False):
+def highest_density_interval(pmf,just_best = False, p=.9):
     '''
-    TODO: add better documentation
+    Calculates the smallest interval of R_t values that gives a probability mass greater than a given threshold `p`
+    OR (if `just_best` is True) just returns the best guess for R_t
+
+    Parameters
+    -----------
+    pmf : pd.Series or pd.DataFrame
+        A series defining the probability mass function for R_t on a particular date (or multiple dates if dataframe) for a particular county
+    
+    just_best : bool
+        If true, function just returns the best estimate of R_t instead of also providing the highest density interval
+
+    p : float (between 0 and 1)
+        The probability mass that the function looks to exceed with a given interval. 
+        The function will look for the smallest interval whose sum of pmf values exceeds this number.
+
+    Outputs
+    --------
+    pd.Series (if `just_best` is false)
+    float (if `just_best` is true)
     '''
 
-    # If we pass a DataFrame, just call this recursively on the columns
+    # If we pass a DataFrame, just call this recursively on the columns (each of which corresponds to a different date)
     if(isinstance(pmf, pd.DataFrame)):
-        return pd.DataFrame([highest_density_interval(pmf[col], p=p) for col in pmf],
+        return pd.DataFrame([highest_density_interval(pmf[col],just_best, p=p) for col in pmf],
                             index=pmf.columns)
     
+    if just_best:
+        return pmf.idxmax()
+
     cumsum = np.cumsum(pmf.values)
     
     # N x N matrix of total probability mass for each low, high
@@ -201,11 +227,31 @@ def highest_density_interval(pmf, p=.9, debug=False):
     lows, highs = (total_p > p).nonzero()
     
     # Find the smallest range (highest density)
-    best = (highs - lows).argmin()
+    try:
+        best = (highs - lows).argmin()
+    except:
+        print(pmf)
     
     low = pmf.index[lows[best]]
     high = pmf.index[highs[best]]
+    best_rt = pmf.idxmax()
     
-    return pd.Series([low, high],
+    return pd.Series([low, best_rt, high],
                      index=[f'Low_{p*100:.0f}',
+                            f'Best_Guess',
                             f'High_{p*100:.0f}'])
+
+def run():
+    '''
+    Runs through steps to calculate latest R_t values for each county
+    '''
+    county_data = get_data()
+    #smooth the data
+    smoothed_data = county_data.apply(smooth_cases, axis=1, return_original=False, cutoff=4)
+    #get the posterior distributions for R_ts for each date in each county
+    posterior_distr = smoothed_data.apply(get_posteriors, axis=1)
+    #get the high,low, and best guess for R_t for the last date in the data
+    latest_rts = posterior_distr.apply(lambda x: highest_density_interval(x.iloc[:,-1]))
+
+    #returns a dataframe with index corresponding to FIPS codes and 3 columns of low, best, high R_t values for the most recent date in county_data
+    return(latest_rts)
